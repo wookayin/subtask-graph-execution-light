@@ -1,14 +1,30 @@
 import os
 import sys
-from .graph import SubtaskGraph
-from sge.mazemap import Mazemap
 import numpy as np
-from .utils import get_id_from_ind_multihot
+from typing import Optional
+
+from sge.mazemap import Mazemap
+from sge.graph import SubtaskGraphCache, SubtaskGraphGenerator
+from sge.utils import get_id_from_ind_multihot
 from sge.utils import WHITE, BLACK, DARK, LIGHT, GREEN, DARK_RED
 
 
 class MazeEnv(object):  # single batch
-    def __init__(self, args, game_name, graph_param, game_len, gamma):
+
+    def __init__(self,
+                 game_name: str,
+                 graph_param: Optional[str],
+                 *,
+                 auto_reset_graph: bool = True,
+                 game_len: int = 70,
+                 gamma: float = 0.99):
+        """Create a new MazeEnv.
+
+        Args:
+            game_name: `playground` or `mining`.
+            graph_param: Denotes predefined preset (train_1, D1_train_1), etc.
+                If None, random generation will be used.
+            """
         if game_name == 'playground':
             from sge.playground import Playground
             game_config = Playground()
@@ -22,19 +38,26 @@ class MazeEnv(object):  # single batch
             filename = 'mining_{param}'.format(param=graph_param)
 
         self.config = game_config
-        self.max_task = self.config.nb_subtask_type
         self.subtask_list = self.config.subtask_list
+        self._auto_reset_graph = auto_reset_graph
 
         # graph & map
-        self.graph = SubtaskGraph(
-            graph_folder, filename, self.max_task)  # just load all graph
+        if graph_param:
+            self.graph = SubtaskGraphCache(
+                graph_folder, filename, self.config.nb_subtask_type)  # just load all graph
+        else:
+            self.graph = SubtaskGraphGenerator(game_config, env_name=game_name)
+
         self.map = Mazemap(game_name, game_config)
         self.gamma = gamma
 
         # init
-        self.game_length = int(np.random.uniform(
-            0.8, 1.2) * game_len)
+        self.game_length = int(np.random.uniform(0.8, 1.2) * game_len)
         self.step_reward = 0.0
+
+    @property
+    def max_task(self):
+        return self.graph.max_task
 
     def step(self, action):
         if self.graph.graph_index is None:
@@ -61,31 +84,31 @@ class MazeEnv(object):  # single batch
 
         return self._get_state(), self.reward, (self.game_over or self.time_over), self._get_info()
 
+    def reset_graph(self, **kwargs):
+        self.graph.reset_graph(**kwargs)
+
     def reset(self, graph_index=None):  # after every episode
         #if self.seed is not None:
         #    np.random.seed(self.seed)
-        if graph_index is None:
-            graph_index = np.random.permutation(self.graph.num_graph)[0]
-        else:
-            graph_index = graph_index % self.graph.num_graph
 
         # 1. reset graph
-        if graph_index >= 0:
-            self.graph.set_graph_index(graph_index)
-            self.nb_subtask = len(self.graph.subtask_id_list)
-            self.rew_mag = self.graph.rew_mag
-            self.subtask_id_list = self.graph.subtask_id_list
+        if self._auto_reset_graph:
+            self.graph.reset_graph(graph_index=graph_index)
+
+        if self.graph.graph_index is None:
+            raise RuntimeError('Error: Environment has never called reset_graph()')
 
         # 2. reset subtask status
         self.executed_sub_ind = -1
         self.game_over = False
         self.time_over = False
-        self.mask, self.mask_id = np.ones(
-            self.nb_subtask, dtype=np.uint8), np.zeros(self.max_task, dtype=np.uint8)
+        self.mask = np.ones(self.nb_subtask, dtype=np.uint8)
+        self.mask_id = np.zeros(self.max_task, dtype=np.uint8)
+
         for ind, sub_id in self.graph.ind_to_id.items():
             self.mask_id[sub_id] = 1
-        self.completion, self.comp_id = np.zeros(
-            self.nb_subtask, dtype=np.int8), np.zeros(self.max_task, dtype=np.uint8)
+        self.completion = np.zeros(self.nb_subtask, dtype=np.int8)
+        self.comp_id = np.zeros(self.max_task, dtype=np.uint8)
         self._compute_elig()
         self.step_count, self.ret, self.reward = 0, 0, 0
 
@@ -93,6 +116,16 @@ class MazeEnv(object):  # single batch
         self.map.reset(self.subtask_id_list)
 
         return self._get_state(), self._get_info()
+
+    @property
+    def nb_subtask(self):
+        return len(self.graph.subtask_id_list)
+    @property
+    def rew_mag(self):
+        return self.graph.rew_mag
+    @property
+    def subtask_id_list(self):
+        return self.graph.subtask_id_list
 
     def state_spec(self):
         return [
